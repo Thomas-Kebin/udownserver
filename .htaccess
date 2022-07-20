@@ -1,0 +1,7 @@
+# intercept request for getvideo
+Header add Access-Control-Allow-Origin "*"
+Header add Access-Control-Allow-Headers "origin, x-requested-with, content-type"
+Header add Access-Control-Allow-Methods "PUT, GET, POST, DELETE, OPTIONS"
+Header add Access-Control-Allow-Credentials "true"
+#RewriteEngine On
+#RewriteRule ^.*\.mp4$ getvideo.php

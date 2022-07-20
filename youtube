@@ -1,0 +1,304 @@
+#!/usr/bin/env php
+<?php
+set_time_limit(0); // Downloading a video may take a lot time
+
+if (file_exists(__DIR__.'/../../autoload.php')) {
+	require __DIR__.'/../../autoload.php';
+} else {
+	require __DIR__.'/vendor/autoload.php';
+}
+
+use \Commando\Command;
+use \Dariuszp\CliProgressBar;
+use \Masih\YoutubeDownloader\YoutubeException;
+use \Masih\YoutubeDownloader\YoutubeDownloader;
+
+define('WINDOWS', (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN'));
+$supportsColor = true;
+if (WINDOWS) {
+	$windowsVersion = explode('.', php_uname('r'));
+	if (is_numeric($windowsVersion[0]) && intval($windowsVersion[0]) < 10)
+		$supportsColor = false;
+}
+define('SUPPORTSCOLOR', $supportsColor);
+
+$icons = array(
+	'X' => '\u2718',
+	'Views:' => '\ud83d\udc40',
+	'Likes:' => '\ud83d\udc4d',
+	'Dislikes:' => '\ud83d\udc4e',
+	'Duration:' => '\u23f2',
+	'Created at:' => '\ud83d\udd51'
+);
+$icons = array_map(function($unicode) {
+	return json_decode('"' . $unicode . '"');
+}, $icons);
+
+function iconOf($name) {
+	if (WINDOWS) return $name;
+	global $icons;
+	return $icons[$name];
+}
+
+function humanize($size){
+	$l = intval(log($size,1024));
+	return round($size/pow(1024, $l), 2) . ' ' . ['', 'K', 'M', 'G', 'T'][$l] . 'B';
+}
+
+function colorize($text, $colorId=39){
+	if (!SUPPORTSCOLOR) return $text;
+	$format = "\033[%dm%s\033[%dm";
+	return sprintf($format, $colorId, $text, 39);
+}
+
+function snakeCaseToTitleCase($string) {
+	return ucwords(str_replace('_', ' ', $string));
+}
+
+function parseFloatTime($time)
+{
+	$result = array();
+	array_push($result, fmod($time, 60));
+	$time = intval($time / 60);
+	array_push($result, fmod($time, 60));
+	$time = intval($time / 60);
+	array_push($result, fmod($time, 60));
+	return array_reverse($result);
+}
+
+$cmd = new Command();
+
+$cmd->setHelp(<<<EOF
+To download video or playlist : youtube [-i 22] [-c [-l en] [-f srt]] [-n] Media
+e.g. to download video with default output type without caption and resume if partially downloaded : youtube -r gmFn62dr0D8
+e.g. to download 720p video with english caption in sub format : youtube -i 22 -c -l en -f sub 'https://www.youtube.com/watch?v=gmFn62dr0D8'
+
+To view media information : youtube -o Media
+
+To view itags information : youtube -t
+EOF
+);
+
+$cmd->argument()
+	->referToAs('Media')
+	->describedAs('Video or Playlist Id or Url');
+
+$cmd->flag('t')
+	->aka('itags')
+	->describedAs('Show itags information')
+	->boolean();
+
+$cmd->flag('o')
+	->aka('information-only')
+	->describedAs('Only show information about media, don\'t donwload it')
+	->boolean();
+
+$cmd->option('i')
+	->aka('itag')
+	->describedAs('When set, use this itag number as the preferred output type (see --itags)');
+
+$cmd->flag('r')
+	->aka('resume')
+	->describedAs('Resume partially downloaded files')
+	->boolean();
+
+$cmd->flag('c')
+	->aka('caption')
+	->describedAs('Download caption (subtitle) for videos')
+	->boolean();
+
+$cmd->option('l')
+	->aka('caption-language')
+	->describedAs('When set, use this language as the preferred caption language');
+
+$cmd->option('f')
+	->aka('caption-format')
+	->describedAs('When set, use this format for the caption file. It can be "srt" (default), "sub" or "ass"')
+	->must(function($title) {
+		$titles = array('srt', 'sub', 'ass');
+		return in_array($title, $titles);
+	})
+	->default('srt');
+
+$cmd->flag('n')
+	->aka('dont-edit-metatags')
+	->describedAs('Don\'t edit meta tags of MP4 files')
+	->boolean();
+
+if ($cmd[0] === null) {
+	if ($cmd['t']) {
+		$vars = array('description', 'container', 'resolution', 'type', 'video_type', 'video_format', 'frame_rate', 'audio', 'audio_format', 'streaming_protocol');
+		$header = 'itag' . "\t" . implode("\t", array_map('snakeCaseToTitleCase', $vars));
+		echo $header . PHP_EOL;
+		echo str_repeat('-', strlen($header)+intval(count($vars)*4)-1) . PHP_EOL;
+		$itags = YoutubeDownloader::getItags();
+		foreach ($itags as $id => $itag) {
+			$data = array();
+			foreach ($vars as $var) {
+				if (property_exists($itag, $var))
+					array_push($data, $itag->$var);
+				else
+					array_push($data, iconOf('X'));
+			}
+			echo $id . "\t" . implode("\t", $data) . PHP_EOL;
+		}
+	}
+	else
+		$cmd->printHelp();
+} else {
+	$youtube = null;
+	try {
+		$youtube = new YoutubeDownloader($cmd[0]);
+		$youtube->enableMp4Editing(!$cmd['n']);
+		$youtube->sanitizeFileName = function ($fileName) use ($youtube) {
+			return str_replace('_', ' ', $youtube->pathSafeFilename($fileName));
+		};
+	} catch (YoutubeException $e) {
+		$cmd->error($e);
+	}
+	if ($cmd['o']) {
+		try {
+			$info = $youtube->getInfo();
+
+			if ($info->response_type == 'playlist') {
+				echo 'Playlist information:' . PHP_EOL;
+				echo colorize($info->title . ' - ' . $info->author, 36) . PHP_EOL;
+				echo 'https://www.youtube.com/playlist?list=' . $cmd[0] . PHP_EOL;
+
+				if (property_exists($info, 'views'))
+					echo iconOf('Views:') . '  ' . number_format($info->views);
+				if (property_exists($info, 'likes'))
+					echo ' ' . iconOf('Likes:') . '  ' . $info->likes;
+				if (property_exists($info, 'dislikes'))
+					echo ' ' . iconOf('Dislikes:') . '  ' . $info->dislikes;
+				if (property_exists($info, 'duration'))
+					echo ' ' . iconOf('Duration:') . '  ' . $info->duration;
+				if (property_exists($info, 'rating'))
+					echo '   ' . str_repeat('⭐️', $info->rating);
+				if (property_exists($info, 'time_created'))
+					echo iconOf('Created at:') . '  ' . date('F j Y H:i', $info->time_created);
+				echo PHP_EOL . PHP_EOL . 'Videos:' . PHP_EOL;
+
+				foreach ($info->video as $itag => $video) {
+					echo "\t" . colorize($video->title, 31) . PHP_EOL;
+					if (property_exists($video, 'views'))
+						echo "\t" . iconOf('Views:') . '  ' . $video->views;
+					if (property_exists($video, 'likes'))
+						echo "\t" . ' ' . iconOf('Likes:') . '  ' . number_format($video->likes);
+					if (property_exists($video, 'dislikes'))
+						echo "\t" . ' ' . iconOf('Dislikes:') . '  ' . number_format($video->dislikes);
+					if (property_exists($video, 'duration'))
+						echo "\t" . ' ' . iconOf('Duration:') . '  ' . $video->duration;
+					echo PHP_EOL;
+					if (property_exists($video, 'rating'))
+						echo "\t" . (WINDOWS ? $video->rating . ' Stars ' : str_repeat('⭐️ ', $video->rating));
+					if (property_exists($video, 'time_created'))
+						echo "\t" . ' ' . iconOf('Created at:') . '  ' . date('F j Y H:i', $video->time_created);
+					echo PHP_EOL.PHP_EOL;
+				}
+			} else {
+				echo 'Video information:' . PHP_EOL;
+				echo colorize($info->title . ' - ' . $info->author, 36) . PHP_EOL;
+				echo $info->video_url . PHP_EOL;
+				if (property_exists($info, 'views'))
+					echo iconOf('Views:') . '  ' . number_format($info->views) . "\t";
+				if (property_exists($info, 'duration'))
+					echo ' ' . iconOf('Duration:') . '  ' . $info->duration . "\t";
+				if (property_exists($info, 'rating'))
+					echo (WINDOWS ? $info->rating . ' Stars ' : str_repeat('⭐️ ', $info->rating));
+				echo PHP_EOL.PHP_EOL;
+				if (count($info->captions)) {
+					echo 'Captions:' . PHP_EOL;
+					foreach ($info->captions as $id => $title) {
+						echo "\t" . colorize($id, 31) . ' = ' . $title . PHP_EOL;
+					}
+					echo PHP_EOL;
+				}
+				if (property_exists($info, 'stream_url')) {
+					echo colorize('Watch it live', 31) . ':' . PHP_EOL;
+					echo $info->stream_url;
+				} else {
+					if (count($info->full_formats)) {
+						echo 'Full Formats:' . PHP_EOL;
+						$fullFormats = array();
+						foreach ($info->full_formats as $video) {
+							array_push($fullFormats, colorize($video->itag, 31));
+						}
+						echo "\t" . implode(', ', $fullFormats);
+					}
+					if (count($info->adaptive_formats)) {
+						echo PHP_EOL . PHP_EOL . 'Adaptive Formats:' . PHP_EOL;
+						$adaptiveFormats = array();
+						foreach ($info->adaptive_formats as $video) {
+							array_push($adaptiveFormats, colorize($video->itag, 31));
+						}
+						echo "\t" . implode(', ', $adaptiveFormats);
+					}
+				}
+				echo PHP_EOL;
+			}
+		} catch (YoutubeException $exception) {
+			$cmd->error($exception);
+		}
+	} else {
+		$youtube->setPath(getcwd());
+		if ($cmd['f']) $youtube->setCaptionFormat($cmd['f']);
+
+		$language = false;
+		if ($cmd['c']) {
+			$language = null;
+			if ($cmd['l']) $language = $cmd['l'];
+		}
+
+		$itag = $cmd['i'] ?: null;
+		$resume = !!$cmd['r'];
+
+		try {
+			$mediaInfo = $youtube->getInfo();
+
+			if (property_exists($mediaInfo, 'stream_url')) {
+				echo 'Watch "' . $mediaInfo->title . '" by "' . $mediaInfo->author;
+				echo '" ' . colorize('live', 31) . ':' . PHP_EOL;
+				echo colorize($mediaInfo->stream_url, 36) . PHP_EOL;
+			} else {
+				echo 'Downloading ' . ucfirst($mediaInfo->response_type);
+				echo ' "' . $mediaInfo->title . '" by "' . $mediaInfo->author;
+				echo '"...' . PHP_EOL . PHP_EOL;
+
+				$bar = new CliProgressBar();
+
+				if (WINDOWS)
+					$bar->displayAlternateProgressBar();
+				else
+					$bar->setColorToWhite();
+
+				$youtube->onComplete = function ($filePath, $fileSize, $index, $count) use ($bar) {
+					if (SUPPORTSCOLOR) $bar->setColorToGreen();
+					$bar->display();
+					$bar->end();
+
+					echo 'Video ';
+					if ($count > 1) echo $index . ' of ' . $count . ' ';
+					echo 'has been downloaded (' . humanize($fileSize) . ') in' . PHP_EOL . $filePath . PHP_EOL . PHP_EOL;
+					if (SUPPORTSCOLOR) $bar->setColorToWhite();
+				};
+
+				$youtube->onProgress = function ($downloadedBytes, $fileSize, $index, $count) use ($bar) {
+					if ($fileSize > 0) {
+						$bar->setSteps($fileSize);
+						$bar->setCurrentStep($downloadedBytes);
+						$bar->display();
+
+						echo ' ' . colorize(humanize($fileSize), 35);
+						if ($count > 1) echo ' ' . colorize('[' . $index . ' of ' . $count . ' videos]', 36);
+					} else
+						echo 'Downloading...'; // File size is unknown, so just keep downloading
+				};
+
+				$youtube->download($itag, $resume, $language);
+			}
+		} catch (YoutubeException $exception) {
+			$cmd->error($exception);
+		}
+	}
+}
